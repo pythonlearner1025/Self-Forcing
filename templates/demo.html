@@ -378,6 +378,11 @@
 
         socket.on('status', function(data) {
             // showStatus(data.message, 'info');
+            // Handle stop confirmation
+            if (data.message && data.message.includes('stopped')) {
+                enableControls(true);
+                stopPlayback();
+            }
         });
 
         socket.on('progress', function(data) {
@@ -419,6 +424,13 @@
         socket.on('error', function(data) {
             // showStatus(`Error: ${data.message}`, 'error');
             enableControls(true);
+            stopPlayback();
+        });
+
+        socket.on('generation_stopped', function(data) {
+            enableControls(true);
+            stopPlayback();
+            updateProgress(0, 'Generation stopped');
         });
 
         function startGeneration() {
@@ -455,7 +467,8 @@
 
         function stopGeneration() {
             socket.emit('stop_generation');
-            enableControls(true);
+            stopPlayback();
+            // UI will be updated when server confirms stop via status event
         }
 
         function togglePlayback() {
@@ -488,6 +501,11 @@
         }
 
         function resetPlayback() {
+            // Stop generation if it's running
+            if (!document.getElementById('stopBtn').disabled) {
+                socket.emit('stop_generation');
+            }
+            
             stopPlayback();
 
             // Clear the entire frame buffer
@@ -495,6 +513,7 @@
             currentFrameIndex = 0;
             receiveCount = 0;
             receiveRate = 0;
+            startTime = null;
 
             // Reset video display to initial state
             const img = document.getElementById('videoFrame');
@@ -507,10 +526,14 @@
             // Update UI
             updateBufferInfo();
             updateFrameInfo('Reset - buffer cleared');
+            updateProgress(0, 'Ready');
 
             // Disable playback controls since there's no content
             document.getElementById('playBtn').disabled = true;
             document.getElementById('resetBtn').disabled = true;
+            
+            // Enable start button
+            enableControls(true);
         }
 
         function updatePlaybackSpeed() {

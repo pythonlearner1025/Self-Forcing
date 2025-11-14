@@ -227,7 +227,16 @@ class WanDiffusionWrapper(torch.nn.Module):
         aug_t: Optional[torch.Tensor] = None,
         cache_start: Optional[int] = None
     ) -> torch.Tensor:
+        # Enforce a single compute dtype across the model to avoid mismatches
+        model_dtype = next(self.model.parameters()).dtype
+
+        # Cast inputs to model dtype
+        noisy_image_or_video = noisy_image_or_video.to(dtype=model_dtype)
         prompt_embeds = conditional_dict["prompt_embeds"]
+        if torch.is_tensor(prompt_embeds) and prompt_embeds.dtype != model_dtype:
+            prompt_embeds = prompt_embeds.to(dtype=model_dtype)
+        # Write back casted prompt embeds so downstream stays consistent
+        conditional_dict = {**conditional_dict, "prompt_embeds": prompt_embeds}
 
         # [B, F] -> [B]
         if self.uniform_timestep:

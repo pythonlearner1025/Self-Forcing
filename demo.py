@@ -127,7 +127,7 @@ transformer.load_state_dict(state_dict['generator_ema'])
 text_encoder.eval()
 transformer.eval()
 
-transformer.to(dtype=torch.float16)
+transformer.to(dtype=torch.bfloat16)
 text_encoder.to(dtype=torch.bfloat16)
 
 text_encoder.requires_grad_(False)
@@ -155,6 +155,7 @@ socketio = SocketIO(app, cors_allowed_origins="*")
 generation_active = False
 stop_event = Event()
 frame_send_queue = queue.Queue()
+prompt_queue = queue.Queue()  # Queue for new prompts (low-latency switching)
 sender_thread = None
 models_compiled = False
 
@@ -237,6 +238,395 @@ def frame_sender_worker():
 
     print("📡 Frame sender thread stopped")
 
+              
+@torch.no_grad()
+def generate_video_stream_infinite(prompt, seed, enable_torch_compile=False, enable_fp8=False, use_taehv=False):
+    """Generate video and push frames immediately to frontend with low-latency prompt switching."""
+    global generation_active, stop_event, frame_send_queue, prompt_queue, sender_thread, models_compiled, torch_compile_applied, fp8_applied, current_vae_decoder, current_use_taehv, frame_rate, anim_name
+
+    try:
+        generation_active = True
+        stop_event.clear()
+        job_id = generate_timestamp()
+        current_prompt = prompt
+        current_seed = seed
+
+        # Start frame sender thread if not already running
+        if sender_thread is None or not sender_thread.is_alive():
+            sender_thread = Thread(target=frame_sender_worker, daemon=True)
+            sender_thread.start()
+
+        # Emit progress updates
+        def emit_progress(message, progress):
+            try:
+                socketio.emit('progress', {
+                    'message': message,
+                    'progress': progress,
+                    'job_id': job_id
+                })
+            except Exception as e:
+                print(f"❌ Failed to emit progress: {e}")
+
+        emit_progress('Starting generation...', 0)
+
+        # Handle VAE decoder switching
+        if use_taehv != current_use_taehv:
+            emit_progress('Switching VAE decoder...', 2)
+            print(f"🔄 Switching VAE decoder to {'TAEHV' if use_taehv else 'default VAE'}")
+            current_vae_decoder = initialize_vae_decoder(use_taehv=use_taehv)
+            # Update pipeline with new VAE decoder
+            pipeline.vae = current_vae_decoder
+
+        # Handle FP8 quantization
+        if enable_fp8 and not fp8_applied:
+            emit_progress('Applying FP8 quantization...', 3)
+            print("🔧 Applying FP8 quantization to transformer")
+            from torchao.quantization.quant_api import quantize_, Float8DynamicActivationFloat8WeightConfig, PerTensor
+            quantize_(transformer, Float8DynamicActivationFloat8WeightConfig(granularity=PerTensor()))
+            fp8_applied = True
+
+        # Text encoding helper (will be re-run when prompt changes)
+        def encode_current_prompt():
+            """Helper function to encode prompt - used on init and prompt changes"""
+            emit_progress('Encoding text prompt...', 8)
+            cond_dict = text_encoder(text_prompts=[current_prompt])
+            # Ensure all tensors in conditional_dict match transformer compute dtype
+            model_dtype = next(transformer.parameters()).dtype
+            for key, value in cond_dict.items():
+                if torch.is_tensor(value):
+                    cond_dict[key] = value.to(dtype=model_dtype, device=gpu)
+                elif isinstance(value, list):
+                    cond_dict[key] = [v.to(dtype=model_dtype, device=gpu) if torch.is_tensor(v) else v for v in value]
+            if low_memory:
+                gpu_memory_preservation = get_cuda_free_memory_gb(gpu) + 5
+                move_model_to_device_with_memory_preservation(
+                    text_encoder, target_device=gpu, preserved_memory_gb=gpu_memory_preservation)
+            return cond_dict
+        
+        conditional_dict = encode_current_prompt()
+
+        # Handle torch.compile if enabled
+        torch_compile_applied = enable_torch_compile
+        if enable_torch_compile and not models_compiled:
+            # Compile transformer and decoder
+            transformer.compile(mode="max-autotune-no-cudagraphs")
+            if not current_use_taehv and not low_memory and not args.trt:
+                current_vae_decoder.compile(mode="max-autotune-no-cudagraphs")
+
+        # Initialize generation
+        emit_progress('Initializing generation...', 12)
+
+        rnd = torch.Generator(gpu).manual_seed(current_seed)
+        # all_latents = torch.zeros([1, 21, 16, 60, 104], device=gpu, dtype=torch.bfloat16)
+
+        model_dtype = next(transformer.parameters()).dtype
+        pipeline._initialize_kv_cache(batch_size=1, dtype=model_dtype, device=gpu)
+        pipeline._initialize_crossattn_cache(batch_size=1, dtype=model_dtype, device=gpu)
+
+        # Generation parameters
+        num_blocks = 7
+        if current_use_taehv:
+            vae_cache = None
+        else:
+            vae_cache = ZERO_VAE_CACHE
+            for i in range(len(vae_cache)):
+                vae_cache[i] = vae_cache[i].to(device=gpu, dtype=torch.float16)
+
+        total_frames_sent = 0
+        generation_start_time = time.time()
+
+        emit_progress('Generating frames... (frontend handles timing)', 15)
+
+        idx = 0
+        current_num_frames = pipeline.num_frame_per_block
+        # Track total frames generated for KV cache continuity (maintains context across blocks)
+        total_frames_generated = 0
+
+        while True:
+            try:
+                block_start_time = time.time()
+                
+                # Check if new prompt has been queued (low-latency switching)
+                try:
+                    new_prompt_data = prompt_queue.get_nowait()
+                    new_prompt = new_prompt_data['prompt']
+                    new_seed = new_prompt_data['seed']
+                    new_job_id = new_prompt_data['job_id']
+                    
+                    if new_prompt != current_prompt:
+                        print(f"🔄 Prompt changed! Clearing caches and restarting generation...")
+                        print(f"   Old: {current_prompt[:50]}...")
+                        print(f"   New: {new_prompt[:50]}...")
+                        
+                        # Clear the frame send queue of old frames
+                        while not frame_send_queue.empty():
+                            try:
+                                frame_send_queue.get_nowait()
+                                frame_send_queue.task_done()
+                            except queue.Empty:
+                                break
+                        
+                        # Re-initialize caches for new prompt
+                        model_dtype = next(transformer.parameters()).dtype
+                        pipeline._initialize_kv_cache(batch_size=1, dtype=model_dtype, device=gpu)
+                        pipeline._initialize_crossattn_cache(batch_size=1, dtype=model_dtype, device=gpu)
+                        
+                        # Reset VAE cache
+                        if current_use_taehv:
+                            vae_cache = None
+                        else:
+                            vae_cache = ZERO_VAE_CACHE
+                            for i in range(len(vae_cache)):
+                                vae_cache[i] = vae_cache[i].to(device=gpu, dtype=torch.float16)
+                        
+                        # Reset generation state
+                        total_frames_generated = 0
+                        idx = 0
+                        total_frames_sent = 0
+                        generation_start_time = time.time()
+                        
+                        # Update current state
+                        current_prompt = new_prompt
+                        current_seed = new_seed
+                        job_id = new_job_id
+                        
+                        # Re-encode new prompt
+                        conditional_dict = encode_current_prompt()
+                        
+                        # Reset random generator with new seed
+                        rnd = torch.Generator(gpu).manual_seed(current_seed)
+                        
+                        emit_progress(f'Switched to new prompt!', 15)
+                except queue.Empty:
+                    # No new prompt, continue with current one
+                    pass 
+
+                # For infinite generation: generate noise only for this block
+                # The KV cache maintains continuity - it stores context from previous blocks
+                # Match model compute dtype to avoid dtype mismatches
+                model_dtype = next(transformer.parameters()).dtype
+                noisy_input = torch.randn([1, current_num_frames, 16, 60, 104], device=gpu, dtype=model_dtype, generator=rnd)
+                
+                # Calculate the true global position in the sequence
+                # The causal_model.py handles cache eviction automatically via sliding window
+                current_start = total_frames_generated * pipeline.frame_seq_length
+
+                # Denoising loop
+                denoising_start = time.time()
+                for index, current_timestep in enumerate(pipeline.denoising_step_list):
+                    if not generation_active or stop_event.is_set():
+                        break
+
+                    timestep = torch.ones([1, current_num_frames], device=noisy_input.device,
+                                          dtype=torch.int64) * current_timestep
+
+                    # Explicitly ensure float16 dtype before transformer call
+                    noisy_input = noisy_input.to(dtype=torch.float16)
+                    
+                    # Debug: Check dtypes on first iteration
+                    if idx == 0 and index == 0:
+                        print(f"🔍 Dtype check - noisy_input: {noisy_input.dtype}")
+                        for key, value in conditional_dict.items():
+                            if torch.is_tensor(value):
+                                print(f"🔍 Dtype check - conditional_dict[{key}]: {value.dtype}")
+                            elif isinstance(value, list) and len(value) > 0 and torch.is_tensor(value[0]):
+                                print(f"🔍 Dtype check - conditional_dict[{key}][0]: {value[0].dtype}")
+                    
+                    if index < len(pipeline.denoising_step_list) - 1:
+                        _, denoised_pred = transformer(
+                            noisy_image_or_video=noisy_input,
+                            conditional_dict=conditional_dict,
+                            timestep=timestep,
+                            kv_cache=pipeline.kv_cache1,
+                            crossattn_cache=pipeline.crossattn_cache,
+                            current_start=current_start
+                        )
+                        # Ensure dtype consistency - keep same as model dtype
+                        model_dtype = next(transformer.parameters()).dtype
+                        denoised_pred = denoised_pred.to(dtype=model_dtype)
+                        next_timestep = pipeline.denoising_step_list[index + 1]
+                        noisy_input = pipeline.scheduler.add_noise(
+                            denoised_pred.flatten(0, 1),
+                            torch.randn_like(denoised_pred.flatten(0, 1)),
+                            next_timestep * torch.ones([current_num_frames], device=noisy_input.device, dtype=torch.long)
+                        ).unflatten(0, denoised_pred.shape[:2])
+                        # Ensure noisy_input stays at model dtype
+                        noisy_input = noisy_input.to(dtype=model_dtype)
+                    else:
+                        _, denoised_pred = transformer(
+                            noisy_image_or_video=noisy_input,
+                            conditional_dict=conditional_dict,
+                            timestep=timestep,
+                            kv_cache=pipeline.kv_cache1,
+                            crossattn_cache=pipeline.crossattn_cache,
+                            current_start=current_start
+                        )
+                        # Ensure dtype consistency - keep same as model dtype
+                        model_dtype = next(transformer.parameters()).dtype
+                        denoised_pred = denoised_pred.to(dtype=model_dtype)
+
+                if not generation_active or stop_event.is_set():
+                    break
+
+                denoising_time = time.time() - denoising_start
+                print(f"⚡ Block {idx+1} denoising completed in {denoising_time:.2f}s")
+
+      
+
+                # Update KV cache for next block
+                try:
+                    transformer(
+                        noisy_image_or_video=denoised_pred,
+                        conditional_dict=conditional_dict,
+                        timestep=torch.zeros_like(timestep),
+                        kv_cache=pipeline.kv_cache1,
+                        crossattn_cache=pipeline.crossattn_cache,
+                        current_start=current_start,
+                    )
+                except Exception as e:
+                    print(f"⚠️ Warning: KV cache update failed: {e}")
+                    # Continue anyway
+
+                # Decode to pixels and send frames immediately
+                print(f"🎨 Decoding block {idx+1} to pixels...")
+                decode_start = time.time()
+                try:
+                    if args.trt:
+                        all_current_pixels = []
+                        for i in range(denoised_pred.shape[1]):
+                            is_first_frame = torch.tensor(1.0).cuda().half() if idx == 0 and i == 0 else \
+                                torch.tensor(0.0).cuda().half()
+                            outputs = current_vae_decoder.forward(denoised_pred[:, i:i + 1, :, :, :].half(), is_first_frame, *vae_cache)
+                            # outputs = current_vae_decoder.forward(denoised_pred.float(), *vae_cache)
+                            current_pixels, vae_cache = outputs[0], outputs[1:]
+                            print(current_pixels.max(), current_pixels.min())
+                            all_current_pixels.append(current_pixels.clone())
+                        pixels = torch.cat(all_current_pixels, dim=1)
+                        if idx == 0:
+                            pixels = pixels[:, 3:, :, :, :]  # Skip first 3 frames of first block
+                    else:
+                        if current_use_taehv:
+                            if vae_cache is None:
+                                vae_cache = denoised_pred
+                            else:
+                                denoised_pred = torch.cat([vae_cache, denoised_pred], dim=1)
+                                vae_cache = denoised_pred[:, -3:, :, :, :]
+                            # TAEHV expects float16; cast for decode
+                            pixels = current_vae_decoder.decode(denoised_pred.to(dtype=torch.float16))
+                            print(f"denoised_pred shape: {denoised_pred.shape}")
+                            print(f"pixels shape: {pixels.shape}")
+                            if idx == 0:
+                                pixels = pixels[:, 3:, :, :, :]  # Skip first 3 frames of first block
+                            else:
+                                pixels = pixels[:, 12:, :, :, :]
+
+                        else:
+                            pixels, vae_cache = current_vae_decoder(denoised_pred.half(), *vae_cache)
+                            if idx == 0:
+                                pixels = pixels[:, 3:, :, :, :]  # Skip first 3 frames of first block
+                except Exception as e:
+                    print(f"❌ VAE decoding failed: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    emit_progress(f'VAE decoding error: {str(e)}', 50)
+                    break
+
+                decode_time = time.time() - decode_start
+                print(f"🎨 Block {idx+1} VAE decoding completed in {decode_time:.2f}s")
+
+                # Queue frames for non-blocking sending
+                try:
+                    block_frames = pixels.shape[1]
+                    print(f"📡 Queueing {block_frames} frames from block {idx+1} for sending...")
+                    queue_start = time.time()
+
+                    for frame_idx in range(block_frames):
+                        if not generation_active or stop_event.is_set():
+                            break
+
+                        frame_tensor = pixels[0, frame_idx].cpu()
+
+                        # Queue frame data in non-blocking way
+                        try:
+                            frame_send_queue.put((frame_tensor, total_frames_sent, idx, job_id), timeout=5.0)
+                            total_frames_sent += 1
+                        except queue.Full:
+                            print(f"⚠️ Warning: Frame queue full, skipping frame {frame_idx}")
+                            break
+
+                    queue_time = time.time() - queue_start
+                    block_time = time.time() - block_start_time
+                    print(f"✅ Block {idx+1} completed in {block_time:.2f}s ({block_frames} frames queued in {queue_time:.3f}s)")
+                except Exception as e:
+                    print(f"❌ Frame queueing failed: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    emit_progress(f'Frame queueing error: {str(e)}', 60)
+                    break
+
+                # Update progress for infinite generation
+                progress = min(15 + (idx % 10) * 8, 95)
+                emit_progress(f'Generating block {idx+1}...', progress)
+
+                # Increment total frames for next block's KV cache positioning
+                # This maintains continuity - each block continues from where the previous ended
+                total_frames_generated += current_num_frames
+                idx += 1
+                
+            except Exception as e:
+                print(f"❌ Block {idx+1} generation failed: {e}")
+                import traceback
+                traceback.print_exc()
+                emit_progress(f'Block generation error: {str(e)}', 50)
+                # Continue to next block instead of breaking
+                idx += 1
+                if idx > 100000:  # Safety limit (very high for truly infinite generation)
+                    print("⚠️ Reached maximum block limit, stopping infinite generation")
+                    break
+
+        generation_time = time.time() - generation_start_time
+        print(f"🎉 Generation completed in {generation_time:.2f}s! {total_frames_sent} frames queued for sending")
+
+        # Wait for all frames to be sent before completing
+        emit_progress('Waiting for all frames to be sent...', 97)
+        print("⏳ Waiting for all frames to be sent...")
+        frame_send_queue.join()  # Wait for all queued frames to be processed
+        print("✅ All frames sent successfully!")
+
+        #generate_mp4_from_images("./images","./videos/"+anim_name+".mp4", frame_rate )
+        # Final progress update
+        emit_progress('Generation complete!', 100)
+
+        try:
+            socketio.emit('generation_complete', {
+                'message': 'Video generation completed!',
+                'total_frames': total_frames_sent,
+                'generation_time': f"{generation_time:.2f}s",
+                'job_id': job_id
+            })
+        except Exception as e:
+            print(f"❌ Failed to emit generation complete: {e}")
+
+    except Exception as e:
+        print(f"❌ Generation failed: {e}")
+        import traceback
+        traceback.print_exc()
+        try:
+            socketio.emit('error', {
+                'message': f'Generation failed: {str(e)}',
+                'job_id': job_id if 'job_id' in locals() else 'unknown'
+            })
+        except Exception as emit_error:
+            print(f"❌ Failed to emit error: {emit_error}")
+    finally:
+        generation_active = False
+        stop_event.set()
+
+        # Clean up sender thread
+        try:
+            frame_send_queue.put(None)
+        except Exception as e:
+            print(f"❌ Failed to put None in frame_send_queue: {e}")
 
 @torch.no_grad()
 def generate_video_stream(prompt, seed, enable_torch_compile=False, enable_fp8=False, use_taehv=False):
@@ -306,8 +696,9 @@ def generate_video_stream(prompt, seed, enable_torch_compile=False, enable_fp8=F
         rnd = torch.Generator(gpu).manual_seed(seed)
         # all_latents = torch.zeros([1, 21, 16, 60, 104], device=gpu, dtype=torch.bfloat16)
 
-        pipeline._initialize_kv_cache(batch_size=1, dtype=torch.float16, device=gpu)
-        pipeline._initialize_crossattn_cache(batch_size=1, dtype=torch.float16, device=gpu)
+        model_dtype = next(transformer.parameters()).dtype
+        pipeline._initialize_kv_cache(batch_size=1, dtype=model_dtype, device=gpu)
+        pipeline._initialize_crossattn_cache(batch_size=1, dtype=model_dtype, device=gpu)
 
         noise = torch.randn([1, 21, 16, 60, 104], device=gpu, dtype=torch.float16, generator=rnd)
 
@@ -552,17 +943,17 @@ def handle_disconnect():
 
 @socketio.on('start_generation')
 def handle_start_generation(data):
-    global generation_active, frame_number, anim_name, frame_rate
+    global generation_active, frame_number, anim_name, frame_rate, prompt_queue
 
     frame_number = 0
-    if generation_active:
-        emit('error', {'message': 'Generation already in progress'})
-        return
 
     prompt = data.get('prompt', '')
+    if not prompt:
+        emit('error', {'message': 'Prompt is required'})
+        return
 
     seed = data.get('seed', -1)
-    if seed==-1:
+    if seed == -1:
         seed = random.randint(0, 2**32)
 
     # Extract words up to the first punctuation or newline
@@ -576,26 +967,36 @@ def handle_start_generation(data):
     # Create anim_name with the extracted words and first 10 characters of the hash
     anim_name = f"{words_up_to_punctuation[:20]}_{str(seed)}_{sha256_hash[:10]}"
 
-    generation_active = True
-    generation_start_time = time.time()
     enable_torch_compile = data.get('enable_torch_compile', False)
     enable_fp8 = data.get('enable_fp8', False)
     use_taehv = data.get('use_taehv', False)
-    frame_rate = data.get('fps', 6)
+    frame_rate = data.get('fps', 10)
 
-    if not prompt:
-        emit('error', {'message': 'Prompt is required'})
-        return
+    # Generate new job ID for this prompt
+    new_job_id = generate_timestamp()
 
-    # Start generation in background thread
-    socketio.start_background_task(generate_video_stream, prompt, seed,
-                                   enable_torch_compile, enable_fp8, use_taehv)
-    emit('status', {'message': 'Generation started - frames will be sent immediately'})
+    # If generation is NOT active, start it for the first time
+    if not generation_active:
+        print(f"🚀 Starting initial generation with prompt: {prompt[:50]}...")
+        generation_active = True
+        socketio.start_background_task(generate_video_stream_infinite, prompt, seed,
+                                       enable_torch_compile, enable_fp8, use_taehv)
+        emit('status', {'message': 'Generation started - frames will be sent immediately'})
+    else:
+        # Generation is already running - queue the new prompt for low-latency switch
+        print(f"⚡ Queueing new prompt for instant switch: {prompt[:50]}...")
+        prompt_queue.put({
+            'prompt': prompt,
+            'seed': seed,
+            'job_id': new_job_id
+        })
+        emit('status', {'message': 'Switching to new prompt...'})
 
 
 @socketio.on('stop_generation')
 def handle_stop_generation():
     global generation_active, stop_event, frame_send_queue
+    print("🛑 Stop generation requested")
     generation_active = False
     stop_event.set()
 
@@ -605,13 +1006,20 @@ def handle_stop_generation():
     except Exception as e:
         print(f"❌ Failed to put None in frame_send_queue: {e}")
 
+    # Emit status update to confirm stop
     emit('status', {'message': 'Generation stopped'})
+    emit('generation_stopped', {'message': 'Generation stopped successfully'})
 
 # Web routes
 
 
 @app.route('/')
 def index():
+    return render_template('demo_simple.html')
+
+
+@app.route('/advanced')
+def advanced():
     return render_template('demo.html')
 
 

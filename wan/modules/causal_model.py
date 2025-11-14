@@ -20,8 +20,13 @@ import torch.distributed as dist
 # wan 1.3B model has a weird channel / head configurations and require max-autotune to work with flexattention
 # see https://github.com/pytorch/pytorch/issues/133254
 # change to default for other models
-flex_attention = torch.compile(
-    flex_attention, dynamic=False, mode="max-autotune-no-cudagraphs")
+try:
+    flex_attention = torch.compile(
+        flex_attention, dynamic=False, mode="max-autotune-no-cudagraphs")
+except Exception as e:
+    # Fallback if torch.compile fails (e.g., PyTorch 2.9.1 flex_attention bug)
+    print(f"Warning: torch.compile failed for flex_attention, using uncompiled version: {e}")
+    pass
 
 
 def causal_rope_apply(x, grid_sizes, freqs, start_frame=0):
@@ -203,7 +208,8 @@ class CausalWanSelfAttention(nn.Module):
             # If we are using local attention and the current KV cache size is larger than the local attention size, we need to truncate the KV cache
             kv_cache_size = kv_cache["k"].shape[1]
             num_new_tokens = roped_query.shape[1]
-            if self.local_attn_size != -1 and (current_end > kv_cache["global_end_index"].item()) and (
+            #if self.local_attn_size != -1 and (current_end > kv_cache["global_end_index"].item()) and (
+            if (current_end > kv_cache["global_end_index"].item()) and (
                     num_new_tokens + kv_cache["local_end_index"].item() > kv_cache_size):
                 # Calculate the number of new tokens added in this step
                 # Shift existing cache content left to discard oldest tokens
@@ -215,6 +221,12 @@ class CausalWanSelfAttention(nn.Module):
                 kv_cache["v"][:, sink_tokens:sink_tokens + num_rolled_tokens] = \
                     kv_cache["v"][:, sink_tokens + num_evicted_tokens:sink_tokens + num_evicted_tokens + num_rolled_tokens].clone()
                 # Insert the new keys/values at the end
+                # print all values in the below line of code calculating local_end_index
+                print(f'kv_cache["local_end_index"].item(): {kv_cache["local_end_index"].item()}')
+                print(f'current_end: {current_end}')
+                print(f'kv_cache["global_end_index"].item(): {kv_cache["global_end_index"].item()}')
+                print(f'num_evicted_tokens: {num_evicted_tokens}')
+
                 local_end_index = kv_cache["local_end_index"].item() + current_end - \
                     kv_cache["global_end_index"].item() - num_evicted_tokens
                 local_start_index = local_end_index - num_new_tokens

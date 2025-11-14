@@ -61,6 +61,9 @@ def flash_attention(
     assert dtype in half_dtypes
     assert q.device.type == 'cuda' and q.size(-1) <= 256
 
+    # Keep originals for potential fallback path
+    orig_q, orig_k, orig_v = q, k, v
+
     # params
     b, lq, lk, out_dtype = q.size(0), q.size(1), k.size(1), q.dtype
 
@@ -115,22 +118,42 @@ def flash_attention(
             causal=causal,
             deterministic=deterministic)[0].unflatten(0, (b, lq))
     else:
-        assert FLASH_ATTN_2_AVAILABLE
-        x = flash_attn.flash_attn_varlen_func(
-            q=q,
-            k=k,
-            v=v,
-            cu_seqlens_q=torch.cat([q_lens.new_zeros([1]), q_lens]).cumsum(
-                0, dtype=torch.int32).to(q.device, non_blocking=True),
-            cu_seqlens_k=torch.cat([k_lens.new_zeros([1]), k_lens]).cumsum(
-                0, dtype=torch.int32).to(q.device, non_blocking=True),
-            max_seqlen_q=lq,
-            max_seqlen_k=lk,
-            dropout_p=dropout_p,
-            softmax_scale=softmax_scale,
-            causal=causal,
-            window_size=window_size,
-            deterministic=deterministic).unflatten(0, (b, lq))
+        if not FLASH_ATTN_2_AVAILABLE:
+            warnings.warn('Flash attention 2 is not available, falling back to PyTorch SDPA.')
+            # Fallback to SDPA with original tensors
+            return attention(
+                q=orig_q, k=orig_k, v=orig_v,
+                q_lens=q_lens, k_lens=k_lens,
+                dropout_p=dropout_p, softmax_scale=softmax_scale, q_scale=q_scale,
+                causal=causal, window_size=window_size,
+                deterministic=deterministic, dtype=dtype, fa_version=None
+            )
+        # Try FA2 varlen API; if not present, fallback to SDPA
+        try:
+            x = flash_attn.flash_attn_varlen_func(
+                q=q,
+                k=k,
+                v=v,
+                cu_seqlens_q=torch.cat([q_lens.new_zeros([1]), q_lens]).cumsum(
+                    0, dtype=torch.int32).to(q.device, non_blocking=True),
+                cu_seqlens_k=torch.cat([k_lens.new_zeros([1]), k_lens]).cumsum(
+                    0, dtype=torch.int32).to(q.device, non_blocking=True),
+                max_seqlen_q=lq,
+                max_seqlen_k=lk,
+                dropout_p=dropout_p,
+                softmax_scale=softmax_scale,
+                causal=causal,
+                window_size=window_size,
+                deterministic=deterministic).unflatten(0, (b, lq))
+        except Exception as e:
+            warnings.warn(f'Flash attention 2 call failed ({e}); using PyTorch SDPA instead.')
+            return attention(
+                q=orig_q, k=orig_k, v=orig_v,
+                q_lens=q_lens, k_lens=k_lens,
+                dropout_p=dropout_p, softmax_scale=softmax_scale, q_scale=q_scale,
+                causal=causal, window_size=window_size,
+                deterministic=deterministic, dtype=dtype, fa_version=None
+            )
 
     # output
     return x.type(out_dtype)

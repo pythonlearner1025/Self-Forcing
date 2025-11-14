@@ -1,0 +1,380 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Self Forcing - Theater Mode</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.0.0/socket.io.js"></script>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background-color: #000;
+            color: #fff;
+            overflow: hidden;
+            height: 100vh;
+            display: flex;
+            flex-direction: column;
+        }
+
+        .video-container {
+            flex: 1;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            background: #000;
+            position: relative;
+            overflow: hidden;
+        }
+
+        #videoFrame {
+            max-width: 100%;
+            max-height: 100%;
+            object-fit: contain;
+            display: none;
+        }
+
+        #placeholderText {
+            font-size: 1.5em;
+            color: #666;
+            text-align: center;
+            padding: 20px;
+        }
+
+        .frame-info {
+            position: absolute;
+            top: 20px;
+            left: 20px;
+            background: rgba(0, 0, 0, 0.7);
+            padding: 10px 15px;
+            border-radius: 5px;
+            font-size: 0.9em;
+            color: #fff;
+        }
+
+        .controls-bar {
+            background: rgba(20, 20, 20, 0.95);
+            padding: 20px;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            gap: 15px;
+            border-top: 1px solid #333;
+        }
+
+        .prompt-input {
+            flex: 1;
+            max-width: 800px;
+            padding: 12px 20px;
+            background: #222;
+            border: 2px solid #444;
+            border-radius: 25px;
+            color: #fff;
+            font-size: 1em;
+            outline: none;
+            transition: border-color 0.3s;
+        }
+
+        .prompt-input:focus {
+            border-color: #007bff;
+        }
+
+        .prompt-input::placeholder {
+            color: #666;
+        }
+
+        .generate-btn {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border: none;
+            padding: 12px 30px;
+            border-radius: 25px;
+            cursor: pointer;
+            font-size: 1em;
+            font-weight: bold;
+            transition: transform 0.2s, opacity 0.3s;
+            white-space: nowrap;
+        }
+
+        .generate-btn:hover:not(:disabled) {
+            transform: translateY(-2px);
+            opacity: 0.9;
+        }
+
+        .generate-btn:active:not(:disabled) {
+            transform: translateY(0);
+        }
+
+        .generate-btn.generating {
+            background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);
+        }
+
+        .progress-container {
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            height: 3px;
+            background: rgba(255, 255, 255, 0.1);
+            z-index: 1000;
+        }
+
+        .progress-bar {
+            height: 100%;
+            background: linear-gradient(90deg, #667eea 0%, #764ba2 100%);
+            width: 0%;
+            transition: width 0.3s ease;
+        }
+
+        @media (max-width: 768px) {
+            .controls-bar {
+                flex-direction: column;
+                gap: 10px;
+            }
+
+            .prompt-input {
+                width: 100%;
+            }
+
+            .generate-btn {
+                width: 100%;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="progress-container">
+        <div class="progress-bar" id="progressBar"></div>
+    </div>
+
+    <div class="video-container">
+        <img id="videoFrame" src="" alt="Generated video">
+        <div id="placeholderText">Enter a prompt below to begin</div>
+        <div id="frameInfo" class="frame-info" style="display: none;"></div>
+    </div>
+
+    <div class="controls-bar">
+        <input 
+            type="text" 
+            id="promptInput" 
+            class="prompt-input" 
+            placeholder="Describe the video you want to generate..."
+            autocomplete="off"
+        >
+        <button id="generateBtn" class="generate-btn" onclick="startGeneration()">
+            ✨ Generate
+        </button>
+    </div>
+
+    <script>
+        const socket = io();
+        
+        // State management
+        let frameBuffer = [];
+        let currentFrameIndex = 0;
+        let isPlaying = false;
+        let playbackInterval = null;
+        let currentJobId = null;
+        let isGenerating = false;  // Track if generation is active
+        
+        // Fixed configuration (not exposed in UI)
+        const CONFIG = {
+            seed: 69,
+            fps: 16,
+            use_taehv: true,
+            enable_torch_compile: false,
+            enable_fp8: false
+        };
+
+        // Socket event handlers
+        socket.on('connect', function() {
+            console.log('Connected to server');
+        });
+
+        socket.on('progress', function(data) {
+            updateProgress(data.progress);
+            
+            // Track job ID from progress updates and update to latest
+            if (data.job_id) {
+                if (currentJobId !== data.job_id) {
+                    console.log('Job ID updated:', currentJobId, '->', data.job_id);
+                    currentJobId = data.job_id;
+                }
+            }
+        });
+
+        socket.on('frame_ready', function(data) {
+            // Detect job_id change (prompt switch)
+            if (data.job_id && currentJobId && data.job_id !== currentJobId) {
+                console.log('Job ID changed! Clearing old frames. Old:', currentJobId, 'New:', data.job_id);
+                // Clear old frames when prompt switches
+                frameBuffer = [];
+                currentFrameIndex = 0;
+                currentJobId = data.job_id;
+            } else if (data.job_id && !currentJobId) {
+                // First frames arriving
+                console.log('Receiving first frames from job:', data.job_id);
+                currentJobId = data.job_id;
+            }
+            
+            // Add frame to buffer
+            frameBuffer.push(data);
+
+            // Auto-start playback when we have initial buffer
+            if (frameBuffer.length === 5 && !isPlaying) {
+                startPlayback();
+            }
+        });
+
+        socket.on('generation_complete', function(data) {
+            isGenerating = false;
+            updateButtonState(false);
+            updateFrameInfo(`${data.total_frames} frames | ${data.generation_time}`);
+        });
+
+        socket.on('error', function(data) {
+            isGenerating = false;
+            updateButtonState(false);
+            showPlaceholder('Error: ' + data.message);
+            currentJobId = null;
+        });
+
+        socket.on('generation_stopped', function(data) {
+            isGenerating = false;
+            updateButtonState(false);
+            currentJobId = null;
+        });
+
+        // Generation control
+        function startGeneration() {
+            const prompt = document.getElementById('promptInput').value.trim();
+            if (!prompt) {
+                alert('Please enter a prompt');
+                return;
+            }
+
+            if (!isGenerating) {
+                // First time starting - clear everything
+                frameBuffer = [];
+                currentFrameIndex = 0;
+                currentJobId = null;
+                stopPlayback();
+                
+                // Clear display
+                showPlaceholder('Generating...');
+                updateFrameInfo('');
+                updateProgress(0);
+                
+                isGenerating = true;
+            } else {
+                // Switching prompts mid-generation - keep buffer and playback
+                console.log('Switching to new prompt mid-generation');
+                // Don't clear buffer or stop playback for smooth transition
+                // Just reset frame index to continue from current point
+            }
+
+            // Update button state
+            updateButtonState(true);
+
+            // Start generation with fixed config (or queue new prompt)
+            socket.emit('start_generation', {
+                prompt: prompt,
+                seed: CONFIG.seed,
+                fps: CONFIG.fps,
+                enable_torch_compile: CONFIG.enable_torch_compile,
+                enable_fp8: CONFIG.enable_fp8,
+                use_taehv: CONFIG.use_taehv
+            });
+        }
+
+        // Playback control
+        function startPlayback() {
+            if (isPlaying) return;
+            
+            isPlaying = true;
+            const frameDelay = 1000 / CONFIG.fps;
+            
+            playbackInterval = setInterval(() => {
+                if (currentFrameIndex < frameBuffer.length) {
+                    displayFrame(frameBuffer[currentFrameIndex]);
+                    currentFrameIndex++;
+                }
+                // No looping - just wait for more frames or stay on last frame
+            }, frameDelay);
+        }
+
+        function stopPlayback() {
+            isPlaying = false;
+            if (playbackInterval) {
+                clearInterval(playbackInterval);
+                playbackInterval = null;
+            }
+        }
+
+        function displayFrame(frameData) {
+            const videoFrame = document.getElementById('videoFrame');
+            const placeholder = document.getElementById('placeholderText');
+            
+            // frameData.data already contains the full data URI
+            videoFrame.src = frameData.data;
+            videoFrame.style.display = 'block';
+            placeholder.style.display = 'none';
+            
+            updateFrameInfo(`Frame ${frameData.frame_index + 1} | Buffer: ${frameBuffer.length}`);
+        }
+
+        // UI updates
+        function updateButtonState(isGenerating) {
+            const btn = document.getElementById('generateBtn');
+            if (isGenerating) {
+                btn.textContent = '🔄 Generating...';
+                btn.classList.add('generating');
+            } else {
+                btn.textContent = '✨ Generate';
+                btn.classList.remove('generating');
+            }
+        }
+
+        function updateProgress(progress) {
+            document.getElementById('progressBar').style.width = progress + '%';
+        }
+
+        function updateFrameInfo(text) {
+            const frameInfo = document.getElementById('frameInfo');
+            if (text) {
+                frameInfo.textContent = text;
+                frameInfo.style.display = 'block';
+            } else {
+                frameInfo.style.display = 'none';
+            }
+        }
+
+        function showPlaceholder(text) {
+            const videoFrame = document.getElementById('videoFrame');
+            const placeholder = document.getElementById('placeholderText');
+            
+            videoFrame.style.display = 'none';
+            placeholder.style.display = 'block';
+            placeholder.textContent = text;
+        }
+
+        // Keyboard shortcuts
+        document.getElementById('promptInput').addEventListener('keypress', function(e) {
+            if (e.key === 'Enter') {
+                startGeneration();
+            }
+        });
+
+        // Prevent context menu on video
+        document.getElementById('videoFrame').addEventListener('contextmenu', function(e) {
+            e.preventDefault();
+        });
+    </script>
+</body>
+</html>
+
